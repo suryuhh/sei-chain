@@ -32,6 +32,8 @@ type Executor struct {
 	changeSetEncoder NamedChangeSetEncoder
 	missingState     StateReader
 	closed           atomic.Bool
+	// commitGeneration counts the blocks whose state changes have started committing to stateStore.
+	commitGeneration atomic.Uint64
 }
 
 type Option func(*Executor)

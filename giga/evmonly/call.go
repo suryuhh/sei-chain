@@ -8,6 +8,8 @@ import (
 
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/vm"
+
+	gigatypes "github.com/sei-protocol/sei-chain/sei-db/state_db/giga/types"
 )
 
 // callTimeout bounds how long a Call may run before its EVM is cancelled,
@@ -19,22 +21,27 @@ var callTimeout = 60 * time.Second
 // committed state and returns the execution result. It persists no state
 // change.
 func (e *Executor) Call(ctx context.Context, blockCtx BlockContext, msg *core.Message) (*core.ExecutionResult, error) {
-	chainConfig := e.chainConfig(blockCtx)
-	if err := validateBlockContext(chainConfig, blockCtx); err != nil {
-		return nil, err
-	}
 	if e.stateStore == nil {
 		return nil, errMissingStateStore
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-
 	snapshot := e.stateStore.OpenView()
 	if snapshot == nil {
 		return nil, errors.New("giga store returned a nil snapshot")
 	}
 	defer snapshot.Close()
+	return e.CallOnSnapshot(ctx, blockCtx, snapshot, msg)
+}
+
+// CallOnSnapshot executes msg as Call does, against snapshot instead of the current committed state.
+// The caller keeps ownership of snapshot.
+func (e *Executor) CallOnSnapshot(ctx context.Context, blockCtx BlockContext, snapshot gigatypes.StateView, msg *core.Message) (*core.ExecutionResult, error) {
+	chainConfig := e.chainConfig(blockCtx)
+	if err := validateBlockContext(chainConfig, blockCtx); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	stateDB := e.acquireStateDB(gigaSnapshotStateReader{snapshot: snapshot, missingState: e.missingState})
 	defer e.releaseStateDB(stateDB)

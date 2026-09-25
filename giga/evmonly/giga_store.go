@@ -91,11 +91,20 @@ func (e *Executor) executePreparedBlockWithStore(ctx context.Context, req Prepar
 			return nil, fmt.Errorf("store receipts for block %d: %w", req.Context.Number, err)
 		}
 	}
+	// Advanced before the write, so a snapshot opened after it started is never taken for the previous block's.
+	e.commitGeneration.Add(1)
 	if err := stateStore.CommitStateChanges(blockNumber, changesets); err != nil {
 		return nil, fmt.Errorf("commit state changes for block %d: %w", req.Context.Number, err)
 	}
 	ok = true
 	return result, nil
+}
+
+// CommitGeneration returns how many blocks' state changes this executor has started committing to
+// its state store. It advances before a block's changes become visible, so a snapshot opened between
+// two reads that return the same value holds none of the changes of a later block.
+func (e *Executor) CommitGeneration() uint64 {
+	return e.commitGeneration.Load()
 }
 
 type gigaSnapshotStateReader struct {

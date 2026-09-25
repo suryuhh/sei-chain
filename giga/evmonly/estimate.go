@@ -13,6 +13,8 @@ import (
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/gasestimator"
 	"github.com/ethereum/go-ethereum/params"
+
+	gigatypes "github.com/sei-protocol/sei-chain/sei-db/state_db/giga/types"
 )
 
 // estimateGasErrorRatio is the search's allowed overestimation tolerance.
@@ -22,22 +24,27 @@ const estimateGasErrorRatio = 0.015
 // against the current committed state. Like Call it persists no state
 // change; a revert's data is returned alongside the error.
 func (e *Executor) EstimateGas(ctx context.Context, blockCtx BlockContext, msg *core.Message, gasCap uint64) (uint64, []byte, error) {
-	chainConfig := e.chainConfig(blockCtx)
-	if err := validateBlockContext(chainConfig, blockCtx); err != nil {
-		return 0, nil, err
-	}
 	if e.stateStore == nil {
 		return 0, nil, errMissingStateStore
 	}
-	if err := ctx.Err(); err != nil {
-		return 0, nil, err
-	}
-
 	snapshot := e.stateStore.OpenView()
 	if snapshot == nil {
 		return 0, nil, errors.New("giga store returned a nil snapshot")
 	}
 	defer snapshot.Close()
+	return e.EstimateGasOnSnapshot(ctx, blockCtx, snapshot, msg, gasCap)
+}
+
+// EstimateGasOnSnapshot estimates as EstimateGas does, against snapshot instead of the current
+// committed state. The caller keeps ownership of snapshot.
+func (e *Executor) EstimateGasOnSnapshot(ctx context.Context, blockCtx BlockContext, snapshot gigatypes.StateView, msg *core.Message, gasCap uint64) (uint64, []byte, error) {
+	chainConfig := e.chainConfig(blockCtx)
+	if err := validateBlockContext(chainConfig, blockCtx); err != nil {
+		return 0, nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, nil, err
+	}
 
 	// Unpooled: an estimate can hold this stateDB open far longer than a Call.
 	stateDB := newNativeStateDB(gigaSnapshotStateReader{snapshot: snapshot, missingState: e.missingState})

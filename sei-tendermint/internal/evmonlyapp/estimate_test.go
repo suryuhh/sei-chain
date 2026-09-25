@@ -1,6 +1,7 @@
 package evmonlyapp
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 
 	abci "github.com/sei-protocol/sei-chain/sei-tendermint/abci/types"
 	"github.com/sei-protocol/sei-chain/sei-tendermint/libs/utils/require"
+	"github.com/sei-protocol/sei-chain/sei-tendermint/libs/utils/scope"
 	tmproto "github.com/sei-protocol/sei-chain/sei-tendermint/proto/tendermint/types"
 )
 
@@ -74,22 +76,30 @@ func TestEVMOnlyApplicationEvmEstimateGasDoesNotMutateCommittedState(t *testing.
 	require.Equal(t, common.Hash{}, after.GetStorage(contractAddr, slot))
 }
 
-func TestEVMOnlyApplicationEvmEstimateGasRefusesDuringPendingCommit(t *testing.T) {
+func TestEVMOnlyApplicationEvmEstimateGasWaitsOutPendingCommit(t *testing.T) {
 	app := newInitializedEVMOnlyTestApp(t)
 	evmApp := app.(*evmOnlyApplication)
-
-	_, err := app.FinalizeBlock(t.Context(), &abci.RequestFinalizeBlock{
-		Hash: crypto.Keccak256([]byte("block-1")),
-		Header: &tmproto.Header{
-			Height: 1,
-			Time:   time.Unix(1_700_000_001, 0),
-		},
-	})
+	chain := newBlockNumberChain(t)
+	_, err := app.FinalizeBlock(t.Context(), chain.block(t, 1))
 	require.NoError(t, err)
 
-	_, _, err = evmApp.EvmEstimateGas(t.Context(), callMessage(common.Address{}, nil), 0)
+	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	_, _, err = evmApp.EvmEstimateGas(ctx, chain.writeMessage(), 0)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 
-	require.Error(t, err)
+	estimate, err := scope.Run1(t.Context(), func(ctx context.Context, s scope.Scope) (uint64, error) {
+		call := scope.Spawn1(s, func() (uint64, error) {
+			estimate, _, err := evmApp.EvmEstimateGas(ctx, chain.writeMessage(), 0)
+			return estimate, err
+		})
+		if _, err := app.Commit(ctx); err != nil {
+			return 0, err
+		}
+		return call.Join(ctx)
+	})
+	require.NoError(t, err)
+	require.Greater(t, estimate, uint64(params.TxGas))
 }
 
 func TestEVMOnlyApplicationEvmEstimateGasRequiresInitChain(t *testing.T) {
