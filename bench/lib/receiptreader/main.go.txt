@@ -1,0 +1,123 @@
+// Command receiptreader opens a littidx receipt store read-only and prints its latest height, receipt counts and
+// digests over every receipt and over every log FilterLogs returns, for comparing two stores byte for byte.
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"flag"
+	"fmt"
+	"os"
+	"time"
+
+	"github.com/ethereum/go-ethereum/eth/filters"
+	sdk "github.com/sei-protocol/sei-chain/sei-cosmos/types"
+	dbconfig "github.com/sei-protocol/sei-chain/sei-db/config"
+	"github.com/sei-protocol/sei-chain/sei-db/ledger_db/receipt"
+)
+
+func fail(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, format+"\n", args...)
+	os.Exit(2)
+}
+
+func main() {
+	dir := flag.String("receipt-dir", "", "receipt store directory")
+	expectLatest := flag.Int64("expect-latest", 0, "expected latest receipt block")
+	flag.Parse()
+	if *dir == "" || *expectLatest <= 0 {
+		fail("missing required flags")
+	}
+
+	cfg := dbconfig.DefaultReceiptStoreConfig()
+	cfg.Backend = "littidx"
+	cfg.DBDirectory = *dir
+	cfg.ExternalPruning = true
+	store, err := receipt.NewReceiptStore(cfg, nil)
+	if err != nil {
+		fail("open receipt store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(); err != nil {
+			fail("close receipt store: %v", err)
+		}
+	}()
+
+	totalStart := time.Now()
+	latest := store.LatestVersion()
+	earliest := store.EarliestVersion()
+
+	iterStart := time.Now()
+	it, err := store.IterateReceipts(0)
+	if err != nil {
+		fail("open receipt iterator: %v", err)
+	}
+	receiptHash := sha256.New()
+	var receipts, receiptLogs, success, failed uint64
+	for {
+		ok, err := it.Next()
+		if err != nil {
+			_ = it.Close()
+			fail("advance receipt iterator: %v", err)
+		}
+		if !ok {
+			break
+		}
+		r, err := it.Receipt()
+		if err != nil {
+			_ = it.Close()
+			fail("decode receipt: %v", err)
+		}
+		body, err := r.Marshal()
+		if err != nil {
+			_ = it.Close()
+			fail("marshal receipt: %v", err)
+		}
+		sum := sha256.Sum256(body)
+		fmt.Fprintf(receiptHash, "R %020d %08d %s %s\n", it.BlockNumber(), r.TransactionIndex, it.TxHash().Hex(), hex.EncodeToString(sum[:]))
+		receipts++
+		receiptLogs += uint64(len(r.Logs))
+		if r.Status == 1 {
+			success++
+		} else {
+			failed++
+		}
+	}
+	if err := it.Close(); err != nil {
+		fail("close receipt iterator: %v", err)
+	}
+	iterMS := time.Since(iterStart).Milliseconds()
+
+	ctx := sdk.Context{}.WithContext(context.Background())
+	filterStart := time.Now()
+	logs, err := store.FilterLogs(ctx, 2, uint64(latest), filters.FilterCriteria{}, receipt.NewLogBudget(0, 0))
+	if err != nil {
+		fail("filter logs: %v", err)
+	}
+	filterHash := sha256.New()
+	for _, lg := range logs {
+		fmt.Fprintf(filterHash, "L %020d %08d %08d %s %s %x", lg.BlockNumber, lg.TxIndex, lg.Index, lg.TxHash.Hex(), lg.Address.Hex(), lg.Data)
+		for _, topic := range lg.Topics {
+			fmt.Fprintf(filterHash, " %s", topic.Hex())
+		}
+		fmt.Fprint(filterHash, "\n")
+	}
+	filterMS := time.Since(filterStart).Milliseconds()
+	totalMS := time.Since(totalStart).Milliseconds()
+
+	latestOK := 0
+	if latest == *expectLatest {
+		latestOK = 1
+	}
+	countOK := 0
+	if receipts == uint64((*expectLatest-1)*1000) && uint64(len(logs)) == receipts && receiptLogs == receipts {
+		countOK = 1
+	}
+	successOK := 0
+	if success == receipts && failed == 0 {
+		successOK = 1
+	}
+	fmt.Printf("latest=%d expected_latest=%d latest_ok=%d earliest=%d receipts=%d receipt_logs=%d filter_logs=%d count_ok=%d success=%d failed=%d success_ok=%d receipt_digest=%x filter_digest=%x iter_ms=%d filter_ms=%d total_read_ms=%d\n",
+		latest, *expectLatest, latestOK, earliest, receipts, receiptLogs, len(logs), countOK, success, failed, successOK, receiptHash.Sum(nil), filterHash.Sum(nil), iterMS, filterMS, totalMS)
+}

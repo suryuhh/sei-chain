@@ -1,0 +1,35 @@
+{
+  "url": "file://bench/data/files",
+  "files": [
+    {
+      "name": "loop-replay.tar.xz",
+      "bytes": 524756,
+      "sha256": "6a737545e3afdf30959e077c59cff3ce460abdee51ff3a5069838fddad2c17fb",
+      "what": "conflict and swap schedules the execute-loop workloads lay over their transfer blocks"
+    },
+    {
+      "name": "sei-manifest.json",
+      "bytes": 228878,
+      "sha256": "469707dfc5e2621784e83f3ad5bf19fb110af38f7ea1e9cf11ac4dfd74f3bee8",
+      "what": "per-file sha256, block numbers and accepted transaction hashes of sei.tar.xz"
+    },
+    {
+      "name": "sei.tar.xz",
+      "bytes": 1649216,
+      "sha256": "4c815603d23dfea05eba2cd96faa97bab8eee98272d9611d065c0f0ac8d3f62d",
+      "what": "two windows of Sei mainnet EVM traffic (blocks, receipts, prestate traces)"
+    },
+    {
+      "name": "windows-manifest.json",
+      "bytes": 14898,
+      "sha256": "7f89c87b87dd766e024817c2d2abdaa40bb394cc4cab43dbda8f57a21bca955b",
+      "what": "per-file sha256, block numbers and accepted transaction hashes of windows.tar.xz"
+    },
+    {
+      "name": "windows.tar.xz",
+      "bytes": 19514496,
+      "sha256": "977fd8397520f5b9517c0a9f82452bc84c2c2422fafe16a4a475a05fb12fdd1b",
+      "what": "eight recorded Ethereum mainnet windows (blocks, receipts, prestate traces), 2,000 accepted transactions each"
+    }
+  ]
+}
