@@ -41,6 +41,7 @@ type TransactionAPI struct {
 	watermarks         *WatermarkManager
 	globalBlockCache   BlockCache
 	cacheCreationMutex *sync.Mutex
+	awaited            *awaitedTxs
 }
 
 func NewTransactionAPI(
@@ -69,7 +70,30 @@ func NewTransactionAPI(
 	}
 }
 
+// GetTransactionReceipt returns the receipt of hash, or null while it is unknown or its block is
+// not yet readable. A lookup of a transaction this node knows is pending, because it accepted it
+// or holds it in its mempool, waits, up to a bound, for the receipt to become readable before it
+// answers null. Its latency metric excludes that wait.
 func (t *TransactionAPI) GetTransactionReceipt(ctx context.Context, hash common.Hash) (result map[string]any, returnErr error) {
+	startTime := time.Now()
+	var held time.Duration
+	defer func() {
+		recordMetricsWithError(ctx, "eth_getTransactionReceipt", t.connectionType, startTime.Add(held), returnErr, recover())
+	}()
+	w := t.awaited.register(ctx, hash)
+	if w != nil {
+		defer t.awaited.unregister(w)
+	}
+	result, returnErr = getTransactionReceipt(ctx, t, hash)
+	if returnErr != nil || result != nil || w == nil {
+		return result, returnErr
+	}
+	holdStart := time.Now()
+	readable := t.awaited.wait(ctx, w)
+	held = time.Since(holdStart)
+	if !readable {
+		return result, returnErr
+	}
 	return getTransactionReceipt(ctx, t, hash)
 }
 
@@ -78,10 +102,6 @@ func getTransactionReceipt(
 	t *TransactionAPI,
 	hash common.Hash,
 ) (result map[string]any, returnErr error) {
-	startTime := time.Now()
-	defer func() {
-		recordMetricsWithError(ctx, "eth_getTransactionReceipt", t.connectionType, startTime, returnErr, recover())
-	}()
 	sdkctx := t.ctxProvider(LatestCtxHeight)
 
 	receipt, err := t.keeper.GetReceipt(sdkctx, hash)

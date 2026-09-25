@@ -37,6 +37,7 @@ type SendAPI struct {
 	backend          *Backend
 	connectionType   ConnectionType
 	methodTimeout    utils.Option[time.Duration]
+	awaited          *awaitedTxs
 }
 
 type SendConfig struct {
@@ -106,6 +107,7 @@ func (s *SendAPI) SendRawTransaction(ctx context.Context, input hexutil.Bytes) (
 				// No error wrapping, because evm server is too dumb to handle wrapped error.
 				return hash, err
 			}
+			s.awaited.remember(hash)
 			return hash, nil
 		}
 	}
@@ -155,6 +157,9 @@ func (s *SendAPI) SendRawTransaction(ctx context.Context, input hexutil.Bytes) (
 		} else if res.Code != 0 {
 			err = sdkerrors.ABCIError(sdkerrors.RootCodespace, res.Code, "")
 		}
+	}
+	if err == nil {
+		s.awaited.remember(hash)
 	}
 	return
 }
