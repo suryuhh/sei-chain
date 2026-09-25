@@ -21,9 +21,14 @@ type recordingGigaStore struct {
 	commitErr   error
 	commitBlock []int64
 	commits     [][]*proto.NamedChangeSet
+	// onCommit, when set, runs at the start of every CommitStateChanges.
+	onCommit func()
 }
 
 func (s *recordingGigaStore) CommitStateChanges(blockNum int64, changeset []*proto.NamedChangeSet) error {
+	if s.onCommit != nil {
+		s.onCommit()
+	}
 	s.commitBlock = append(s.commitBlock, blockNum)
 	s.commits = append(s.commits, changeset)
 	return s.commitErr
@@ -230,6 +235,44 @@ func TestExecutorCommitsGigaStoreStateChanges(t *testing.T) {
 	require.Equal(t, [][]*proto.NamedChangeSet{wantChangesets}, store.commits)
 	require.Contains(t, result.ChangeSet.Balances, BalanceChange{Address: recipient, Balance: big.NewInt(7)})
 	result.Release()
+}
+
+func TestExecutorCommitGenerationAdvancesBeforeStateChangesLand(t *testing.T) {
+	chainID := big.NewInt(testChainID)
+	key, err := crypto.GenerateKey()
+	require.NoError(t, err)
+	sender := crypto.PubkeyToAddress(key.PublicKey)
+	recipient := testAddress(0xa9)
+
+	// The recording store's snapshot never advances, so every block replays the same funded transfer.
+	snapshot := newMemoryGigaSnapshot(40)
+	snapshot.setBalance(sender, big.NewInt(testFundedBalanceWei))
+	store := &recordingGigaStore{snapshot: snapshot}
+	var executor *Executor
+	var atEncode, atCommit []uint64
+	encoder := func(StateChangeSet) ([]*proto.NamedChangeSet, error) {
+		atEncode = append(atEncode, executor.CommitGeneration())
+		return nil, nil
+	}
+	store.onCommit = func() { atCommit = append(atCommit, executor.CommitGeneration()) }
+	executor = NewExecutor(Config{}, withTestStores(store, NewMemoryReceiptStore(), encoder))
+	require.Equal(t, uint64(0), executor.CommitGeneration())
+
+	rawTx := signLegacyTx(t, key, chainID, 0, &recipient, big.NewInt(7), nil)
+	for height := range uint64(2) {
+		blockCtx := blockContext(chainID)
+		blockCtx.Number = 41 + height
+		result, err := executor.ExecuteBlock(t.Context(), BlockRequest{
+			Context: blockCtx,
+			Txs:     [][]byte{rawTx},
+		})
+		require.NoError(t, err)
+		result.Release()
+	}
+
+	require.Equal(t, []uint64{0, 1}, atEncode)
+	require.Equal(t, []uint64{1, 2}, atCommit)
+	require.Equal(t, uint64(2), executor.CommitGeneration())
 }
 
 func TestExecutorGigaStoreSnapshotFeedsOCCExecution(t *testing.T) {

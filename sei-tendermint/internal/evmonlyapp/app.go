@@ -90,14 +90,16 @@ type evmOnlyApplication struct {
 	storage          *bootstrap.GigaStorageManager
 	changeSetEncoder evmonly.NamedChangeSetEncoder
 	validators       []abci.ValidatorUpdate
-	state            utils.Mutex[*evmOnlyState]
+	// state is never held across a block's execution, so reads of committed
+	// state do not wait for one.
+	state utils.Watch[*evmOnlyState]
 	// checkedSenders maps the hash of every transaction this process admitted
 	// in CheckTx to the sender recovered there, so execution does not recover
 	// it again.
 	checkedSenders utils.Mutex[*senderCache]
 	// finalizePhases times FinalizeBlock's stages around the executor. It is a
 	// field so each application instance has its own last-phase clock.
-	// FinalizeBlock is serialized by state, so one timer is enough per app.
+	// FinalizeBlock refuses to overlap itself, so one timer is enough per app.
 	finalizePhases *seidbmetrics.PhaseTimer
 }
 
@@ -119,19 +121,34 @@ type evmOnlyState struct {
 	committedHeight int64
 	appHash         common.Hash
 	parentHash      common.Hash
-	pending         utils.Option[evmOnlyPending]
+	// executing is set while FinalizeBlock executes a block.
+	executing bool
+	pending   utils.Option[evmOnlyPending]
 	// lastBlockTime is the Time of the most recently committed block, used by
 	// EvmCall to reproduce that block's execution context for a read-only call.
 	lastBlockTime uint64
-	// pendingBlockTime is the Time of the block staged in pending; Commit
-	// promotes it to lastBlockTime.
-	pendingBlockTime uint64
+	// committedGeneration is the executor's CommitGeneration once the most
+	// recently committed block's state changes were written.
+	committedGeneration uint64
 }
 
 type evmOnlyPending struct {
 	height    int64
 	appHash   common.Hash
 	blockHash common.Hash
+	// blockTime is the block's Time; Commit promotes it to lastBlockTime.
+	blockTime uint64
+	// generation is the executor's CommitGeneration after the block executed.
+	generation uint64
+}
+
+// evmOnlyExecution is what FinalizeBlock reads from the committed state to
+// execute the next block.
+type evmOnlyExecution struct {
+	executor   *evmonly.Executor
+	gasLimit   uint64
+	appHash    common.Hash
+	parentHash common.Hash
 }
 
 var _ abci.Application = (*evmOnlyApplication)(nil)
@@ -156,7 +173,7 @@ func NewEVMOnlyApplication(
 		storage:          storage,
 		changeSetEncoder: changeSetEncoder,
 		validators:       slices.Clone(validators),
-		state:            utils.NewMutex(&evmOnlyState{}),
+		state:            utils.NewWatch(&evmOnlyState{}),
 		checkedSenders:   utils.NewMutex(utils.Alloc(newSenderCache())),
 		finalizePhases:   seidbmetrics.NewPhaseTimer(otel.Meter(finalizeMeterName), finalizeTimerName),
 	}
@@ -177,7 +194,7 @@ func (a *evmOnlyApplication) InitChain(req *abci.RequestInitChain) (*abci.Respon
 		if state.executor.IsPresent() {
 			return nil, fmt.Errorf("EVM-only application already initialized")
 		}
-		state.executor = utils.Some(evmonly.NewExecutor(evmonly.Config{
+		executor := evmonly.NewExecutor(evmonly.Config{
 			ChainConfig:         a.chainConfig,
 			MinGasPrice:         big.NewInt(evmOnlyBlockMinGasPrice),
 			OCCWorkers:          workersOrGOMAXPROCS(a.execution.OCCWorkers),
@@ -186,7 +203,9 @@ func (a *evmOnlyApplication) InitChain(req *abci.RequestInitChain) (*abci.Respon
 		},
 			evmonly.WithStorageManager(a.storage, a.changeSetEncoder),
 			evmonly.WithMissingAccountState(evmOnlyFundedState{}),
-		))
+		)
+		state.executor = utils.Some(executor)
+		state.committedGeneration = executor.CommitGeneration()
 		state.gasLimit = gasLimit
 		state.nextHeight = req.InitialHeight
 		state.committedHeight = req.InitialHeight - 1
@@ -393,26 +412,30 @@ func evmOnlyPrevRandao(timestamp uint64) common.Hash {
 	return crypto.Keccak256Hash(binary.BigEndian.AppendUint64(nil, timestamp))
 }
 
-// currentExecutionContext returns the executor and block context for a
-// read-only EVM execution against the most recently committed state. action
-// names the caller for its error messages, e.g. "call" or "gas estimate".
-func (a *evmOnlyApplication) currentExecutionContext(action string) (*evmonly.Executor, evmonly.BlockContext, error) {
-	for state := range a.state.Lock() {
+// committedExecutionContext returns the executor and the block context of the
+// most recently committed block, with the executor's CommitGeneration for that
+// block's state. It waits while the store may already hold a later block's
+// state: from the moment that block's state changes start committing until
+// Commit. action names the caller for its error messages, e.g. "call" or "gas
+// estimate".
+func (a *evmOnlyApplication) committedExecutionContext(ctx context.Context, action string) (*evmonly.Executor, evmonly.BlockContext, uint64, error) {
+	for state, ctrl := range a.state.Lock() {
 		executor, ok := state.executor.Get()
 		if !ok {
-			return nil, evmonly.BlockContext{}, fmt.Errorf("EVM-only %s attempted before InitChain", action)
+			return nil, evmonly.BlockContext{}, 0, fmt.Errorf("EVM-only %s attempted before InitChain", action)
 		}
-		if state.pending.IsPresent() {
-			return nil, evmonly.BlockContext{}, fmt.Errorf("EVM-only %s attempted before committing the finalized block", action)
+		// NUMBER/TIMESTAMP/PrevRandao advance only on Commit, so the committed
+		// block's context must not be combined with a later block's state.
+		if err := ctrl.WaitUntil(ctx, func() bool {
+			return !state.pending.IsPresent() && executor.CommitGeneration() == state.committedGeneration
+		}); err != nil {
+			return nil, evmonly.BlockContext{}, 0, err
 		}
 		number, ok := utils.SafeCast[uint64](state.committedHeight)
 		if !ok {
-			return nil, evmonly.BlockContext{}, fmt.Errorf("EVM-only committed height exceeds uint64: %d", state.committedHeight)
+			return nil, evmonly.BlockContext{}, 0, fmt.Errorf("EVM-only committed height exceeds uint64: %d", state.committedHeight)
 		}
 		// Coinbase and ParentHash are left zero.
-		//
-		// Executor opens its own state snapshot later, outside this lock, so a
-		// commit landing in between can pair this BlockContext with a newer one.
 		return executor, evmonly.BlockContext{
 			Number:      number,
 			Time:        state.lastBlockTime,
@@ -422,30 +445,50 @@ func (a *evmOnlyApplication) currentExecutionContext(action string) (*evmonly.Ex
 			BlobBaseFee: new(big.Int),
 			BlockHash:   state.parentHash,
 			PrevRandao:  evmOnlyPrevRandao(state.lastBlockTime),
-		}, nil
+		}, state.committedGeneration, nil
 	}
 	panic("unreachable")
+}
+
+// openCommittedState returns the executor, the block context of the most
+// recently committed block and a snapshot of that block's state, without
+// waiting for a block being executed. The caller must Close the snapshot.
+func (a *evmOnlyApplication) openCommittedState(ctx context.Context, action string) (*evmonly.Executor, evmonly.BlockContext, gigatypes.StateView, error) {
+	for {
+		executor, blockCtx, generation, err := a.committedExecutionContext(ctx, action)
+		if err != nil {
+			return nil, evmonly.BlockContext{}, nil, err
+		}
+		snapshot := a.storage.StateDB().OpenView()
+		// A block that started committing while the snapshot opened may be in it.
+		if executor.CommitGeneration() == generation {
+			return executor, blockCtx, snapshot, nil
+		}
+		snapshot.Close()
+	}
 }
 
 // EvmCall executes msg as a read-only call against the most recently
 // committed EVM state and returns the execution result.
 func (a *evmOnlyApplication) EvmCall(ctx context.Context, msg *ethcore.Message) (*ethcore.ExecutionResult, error) {
-	executor, blockCtx, err := a.currentExecutionContext("call")
+	executor, blockCtx, snapshot, err := a.openCommittedState(ctx, "call")
 	if err != nil {
 		return nil, err
 	}
-	return executor.Call(ctx, blockCtx, msg)
+	defer snapshot.Close()
+	return executor.CallOnSnapshot(ctx, blockCtx, snapshot, msg)
 }
 
 // EvmEstimateGas returns the lowest gas limit that lets msg execute
 // successfully against the most recently committed EVM state. Like EvmCall
 // it creates no transaction and persists no state change.
 func (a *evmOnlyApplication) EvmEstimateGas(ctx context.Context, msg *ethcore.Message, gasCap uint64) (uint64, []byte, error) {
-	executor, blockCtx, err := a.currentExecutionContext("gas estimate")
+	executor, blockCtx, snapshot, err := a.openCommittedState(ctx, "gas estimate")
 	if err != nil {
 		return 0, nil, err
 	}
-	return executor.EstimateGas(ctx, blockCtx, msg, gasCap)
+	defer snapshot.Close()
+	return executor.EstimateGasOnSnapshot(ctx, blockCtx, snapshot, msg, gasCap)
 }
 
 func (a *evmOnlyApplication) FinalizeBlock(ctx context.Context, req *abci.RequestFinalizeBlock) (*abci.ResponseFinalizeBlock, error) {
@@ -462,59 +505,95 @@ func (a *evmOnlyApplication) FinalizeBlock(ctx context.Context, req *abci.Reques
 		return nil, fmt.Errorf("EVM-only block timestamp is negative: %s", req.Header.Time)
 	}
 	blockHash := common.BytesToHash(req.Hash)
+	execution, err := a.startExecution(height)
+	if err != nil {
+		return nil, err
+	}
+	pending := utils.None[evmOnlyPending]()
+	defer func() { a.finishExecution(pending) }()
+	// Closes the stage in flight, so the gap until the next block is charged to neither.
+	defer a.finalizePhases.Reset()
+	a.finalizePhases.SetPhase(finalizePhaseTakeSenders)
+	senders := a.takeSenders(req.Txs)
+	// The executor's own timer breaks execution down further.
+	a.finalizePhases.SetPhase(finalizePhaseExecute)
+	result, err := execution.executor.ExecuteBlock(ctx, evmonly.BlockRequest{
+		Context: evmonly.BlockContext{
+			Number:      number,
+			Time:        timestamp,
+			GasLimit:    execution.gasLimit,
+			ChainID:     new(big.Int).Set(a.chainID),
+			BaseFee:     evmOnlyBaseFee(),
+			BlobBaseFee: new(big.Int),
+			ParentHash:  execution.parentHash,
+			BlockHash:   blockHash,
+			PrevRandao:  evmOnlyPrevRandao(timestamp),
+		},
+		Txs:     req.Txs,
+		Senders: senders,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer result.Release()
+	appHash, err := hashEVMOnlyResult(execution.appHash, number, blockHash, result)
+	if err != nil {
+		return nil, err
+	}
+	pending = utils.Some(evmOnlyPending{
+		height:     height,
+		appHash:    appHash,
+		blockHash:  blockHash,
+		blockTime:  timestamp,
+		generation: execution.executor.CommitGeneration(),
+	})
+	a.finalizePhases.SetPhase(finalizePhaseTxResults)
+	return &abci.ResponseFinalizeBlock{
+		AppHash:   append([]byte(nil), appHash[:]...),
+		TxResults: evmOnlyABCIResults(result),
+	}, nil
+}
+
+// startExecution marks the block at height as executing and returns what
+// executing it needs. It refuses before InitChain, while another block is
+// executing or awaits Commit, and for any height but the next one.
+func (a *evmOnlyApplication) startExecution(height int64) (evmOnlyExecution, error) {
 	for state := range a.state.Lock() {
 		executor, ok := state.executor.Get()
 		if !ok {
-			return nil, fmt.Errorf("EVM-only block finalized before InitChain")
+			return evmOnlyExecution{}, fmt.Errorf("EVM-only block finalized before InitChain")
+		}
+		if state.executing {
+			return evmOnlyExecution{}, fmt.Errorf("EVM-only block %d finalized while another block executes", height)
 		}
 		if state.pending.IsPresent() {
-			return nil, fmt.Errorf("EVM-only block %d finalized before committing the previous block", height)
+			return evmOnlyExecution{}, fmt.Errorf("EVM-only block %d finalized before committing the previous block", height)
 		}
 		if height != state.nextHeight {
-			return nil, fmt.Errorf("EVM-only block height %d does not match next height %d", height, state.nextHeight)
+			return evmOnlyExecution{}, fmt.Errorf("EVM-only block height %d does not match next height %d", height, state.nextHeight)
 		}
-		// Closes the stage in flight, so the gap until the next block is charged to neither.
-		defer a.finalizePhases.Reset()
-		a.finalizePhases.SetPhase(finalizePhaseTakeSenders)
-		senders := a.takeSenders(req.Txs)
-		// The executor's own timer breaks execution down further.
-		a.finalizePhases.SetPhase(finalizePhaseExecute)
-		result, err := executor.ExecuteBlock(ctx, evmonly.BlockRequest{
-			Context: evmonly.BlockContext{
-				Number:      number,
-				Time:        timestamp,
-				GasLimit:    state.gasLimit,
-				ChainID:     new(big.Int).Set(a.chainID),
-				BaseFee:     evmOnlyBaseFee(),
-				BlobBaseFee: new(big.Int),
-				ParentHash:  state.parentHash,
-				BlockHash:   blockHash,
-				PrevRandao:  evmOnlyPrevRandao(timestamp),
-			},
-			Txs:     req.Txs,
-			Senders: senders,
-		})
-		if err != nil {
-			return nil, err
-		}
-		defer result.Release()
-		appHash, err := hashEVMOnlyResult(state.appHash, number, blockHash, result)
-		if err != nil {
-			return nil, err
-		}
-		state.pending = utils.Some(evmOnlyPending{height: height, appHash: appHash, blockHash: blockHash})
-		state.pendingBlockTime = timestamp
-		a.finalizePhases.SetPhase(finalizePhaseTxResults)
-		return &abci.ResponseFinalizeBlock{
-			AppHash:   append([]byte(nil), appHash[:]...),
-			TxResults: evmOnlyABCIResults(result),
+		state.executing = true
+		return evmOnlyExecution{
+			executor:   executor,
+			gasLimit:   state.gasLimit,
+			appHash:    state.appHash,
+			parentHash: state.parentHash,
 		}, nil
 	}
 	panic("unreachable")
 }
 
-func (a *evmOnlyApplication) Commit(context.Context) (*abci.ResponseCommit, error) {
+// finishExecution ends the execution startExecution began and stages pending,
+// when present, for Commit.
+func (a *evmOnlyApplication) finishExecution(pending utils.Option[evmOnlyPending]) {
 	for state := range a.state.Lock() {
+		state.executing = false
+		state.pending = pending
+	}
+}
+
+func (a *evmOnlyApplication) Commit(context.Context) (*abci.ResponseCommit, error) {
+	for state, ctrl := range a.state.Lock() {
 		pending, ok := state.pending.Get()
 		if !ok {
 			return nil, fmt.Errorf("EVM-only Commit called without a finalized block")
@@ -523,8 +602,10 @@ func (a *evmOnlyApplication) Commit(context.Context) (*abci.ResponseCommit, erro
 		state.nextHeight = pending.height + 1
 		state.appHash = pending.appHash
 		state.parentHash = pending.blockHash
-		state.lastBlockTime = state.pendingBlockTime
+		state.lastBlockTime = pending.blockTime
+		state.committedGeneration = pending.generation
 		state.pending = utils.None[evmOnlyPending]()
+		ctrl.Updated()
 		return &abci.ResponseCommit{}, nil
 	}
 	panic("unreachable")
