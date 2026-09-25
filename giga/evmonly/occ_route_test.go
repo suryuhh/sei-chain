@@ -42,9 +42,9 @@ func TestMeasureDependencies(t *testing.T) {
 	}
 }
 
-// TestRouteAfterSpeculation requires, for blocks of one sample, the sequential path for blocks whose
-// transactions chain through shared keys and the frontier for blocks whose transactions are independent or
-// mostly so.
+// TestRouteAfterSpeculation requires, for blocks of one sample, the frontier for blocks whose transactions
+// are independent, Block-STM for those whose chains through shared keys leave enough parallelism, and the
+// sequential path for those whose chains do not.
 func TestRouteAfterSpeculation(t *testing.T) {
 	want := map[string]occPath{
 		"independent":            occPathFrontier,
@@ -52,10 +52,10 @@ func TestRouteAfterSpeculation(t *testing.T) {
 		"hot_slots_2":            occPathSequential,
 		"hot_slots_4":            occPathSequential,
 		"hot_slots_16":           occPathSequential,
-		"hot_slots_64":           occPathSequential,
+		"hot_slots_64":           occPathBlockSTM,
 		"hot_slots_256":          occPathFrontier,
 		"one_sender":             occPathSequential,
-		"independent_eighth_hot": occPathFrontier,
+		"independent_eighth_hot": occPathBlockSTM,
 		"hot_prefix":             occPathSequential,
 		"hot_tail":               occPathFrontier,
 	}
@@ -93,12 +93,12 @@ func TestOCCDependencySpans(t *testing.T) {
 // block rather than of its first occDependencySample transactions.
 func TestRouteSampleSpansBlock(t *testing.T) {
 	want := map[string]occPath{
-		// 256 of 2,000 transactions chain; the block holds too few such reads to leave the frontier.
-		"hot_prefix": occPathFrontier,
+		// 256 of 2,000 transactions chain through one slot, which leaves the other 1,744 to run in parallel.
+		"hot_prefix": occPathBlockSTM,
 		// The first 256 transactions are independent and the 1,744 after them chain through one slot.
 		"hot_tail": occPathSequential,
 		// Each of 256 slots is incremented by about eight transactions spread through the block.
-		"hot_slots_256": occPathSequential,
+		"hot_slots_256": occPathBlockSTM,
 		"independent":   occPathFrontier,
 	}
 	for _, shape := range routeShapes() {
@@ -127,7 +127,7 @@ func TestOCCRouteMatchesSequential(t *testing.T) {
 			req, state := buildRouteBlock(t, shape, 300)
 			want, err := NewExecutor(Config{MinGasPrice: big.NewInt(0)}).executePreparedBlock(t.Context(), req, state)
 			require.NoError(t, err)
-			for _, path := range []occPath{occPathAuto, occPathFrontier, occPathSequential} {
+			for _, path := range []occPath{occPathAuto, occPathFrontier, occPathSequential, occPathBlockSTM} {
 				executor := NewExecutor(Config{MinGasPrice: big.NewInt(0), OCCWorkers: 8})
 				executor.occPath = path
 				got, err := executor.executePreparedBlock(t.Context(), req, state)
