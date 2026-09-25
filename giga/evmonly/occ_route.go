@@ -13,14 +13,9 @@ const (
 	occPathFrontier
 	// occPathSequential executes the block on the sequential path.
 	occPathSequential
+	// occPathBlockSTM executes the block under Block-STM and hands its results to the frontier.
+	occPathBlockSTM
 )
-
-// occDependentShare is the share of a block's speculative results, as a divisor, that must read a key a lower
-// result wrote for the block to run on the sequential path. The frontier reruns each such result on its own,
-// one after another, with a parallel validation pass between reruns, so a rerun costs several times what the
-// transaction costs in order, and once one result in occDependentShare needs one the frontier finishes
-// later than the sequential path.
-const occDependentShare = 6
 
 // occDependencySample is how many of a block's transactions run speculatively before the executor chooses how
 // to finish the block. It is enough transactions for chains through shared keys to show, few enough that the
@@ -77,17 +72,49 @@ func occSampledResults(results []occTxExecution, spans []occTxRange) []occTxExec
 	return sampled
 }
 
+// occDependentShare is the share of a block's speculative results, as a divisor, that must read a key a lower
+// result wrote for the block to leave the frontier. The frontier reruns each such result on its own, one
+// after another, with a parallel validation pass between reruns, while Block-STM runs a block without such
+// reads about as fast as the frontier does, so a few of them are enough to prefer it. A read shows in the
+// sample only when its writer was sampled too, so the sample holds fewer of them than the block does.
+const occDependentShare = 64
+
+// occBlockSTMMinParallelism is the fewest transactions per link of the longest chain of reads of lower writes
+// at which a block that leaves the frontier runs under Block-STM rather than sequentially. Block-STM
+// finishes no sooner than that chain executes in order, and each link costs it an abort or a wait on the
+// link below, so below this parallelism the sequential path finishes first.
+const occBlockSTMMinParallelism = 4
+
+// occChainedParallelism is the parallelism Block-STM needs instead when at least occChainedShare of the
+// block's transactions read a lower write: nearly every execution then risks an abort, and the waits and
+// re-executions grow with the chains' fan-in, which the depth alone does not show. The sampled chains are
+// shorter than the block's, since the sample skips links, so the parallelism they show is higher than the
+// block's.
+const occChainedParallelism = 48
+
+// occChainedShare is that share, in eighths.
+const occChainedShare = 3
+
 // routeAfterSpeculation returns the path a block takes, from how the speculative results of its sampled
 // transactions depend on each other. A block smaller than one parallel validation pass stays on the frontier,
 // where a rerun costs too little to matter.
 func routeAfterSpeculation(results []occTxExecution) occPath {
-	if len(results) < occMinParallelValidation {
+	n := len(results)
+	if n < occMinParallelValidation {
 		return occPathFrontier
 	}
-	if measureDependencies(results).dependent*occDependentShare >= len(results) {
+	deps := measureDependencies(results)
+	chained := deps.dependent*8 >= n*occChainedShare
+	switch {
+	case deps.dependent*occDependentShare < n:
+		return occPathFrontier
+	case n >= deps.depth*occChainedParallelism:
+		return occPathBlockSTM
+	case !chained && n >= deps.depth*occBlockSTMMinParallelism:
+		return occPathBlockSTM
+	default:
 		return occPathSequential
 	}
-	return occPathFrontier
 }
 
 // occDependencies is how a block's speculative results depend on each other through the keys they read.

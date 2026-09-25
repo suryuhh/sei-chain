@@ -166,6 +166,7 @@ func BenchmarkOCCRoute(b *testing.B) {
 		{"auto", occPathAuto},
 		{"frontier", occPathFrontier},
 		{"sequential", occPathSequential},
+		{"blockstm", occPathBlockSTM},
 	}
 	for _, shape := range routeShapes() {
 		req, state := buildRouteBlock(b, shape, routeBlockTxs)

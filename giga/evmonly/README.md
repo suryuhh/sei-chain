@@ -251,10 +251,13 @@ Before speculating the whole block, the executor speculates 256 of its
 transactions, in 16 runs of 16 consecutive transactions spaced evenly from the
 first transaction to the last (the whole block when it holds at most 256), and
 measures from their read and write sets, in block order, how many read a key a
-lower one wrote. When at least one in six does, the frontier would rerun too many
-of them one at a time, and the block runs on the sequential path instead
-(`OCCStats.Fallback` with reason `dependent`). Otherwise the rest of the block is
-speculated, keeping the sampled results, and validated as above.
+lower one wrote, and the longest chain of such reads. When at least one in 64
+does, the frontier would rerun them one at a time, and the block runs under
+Block-STM (`occ_bstm.go`) if the chains leave enough transactions per link (4,
+or 48 when at least three in eight transactions are chained), and otherwise on
+the sequential path (`OCCStats.Fallback` with reason `dependent`). A block
+without such reads has the rest of it speculated, keeping the sampled results,
+and validated as above.
 
 This is intentionally conservative. A conflict can cause extra reruns, but it
 should not cause a whole-block sequential fallback. The current incarnation cap
