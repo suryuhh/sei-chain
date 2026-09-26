@@ -112,6 +112,16 @@ func NewEVMHTTPServer(
 		traceCtxProvider = traceCtxProviders[0]
 	}
 	txAPI := NewTransactionAPI(tmClient, k, ctxProvider, txConfigProvider, homeDir, ConnectionTypeHTTP, methodTimeout, watermarks, globalBlockCache, cacheCreationMutex)
+	awaited, releaseAwaited := acquireAwaitedTxs(tmClient, txConfigProvider, watermarks)
+	built := false
+	defer func() {
+		if !built {
+			releaseAwaited()
+		}
+	}()
+	httpServer.releaseOnStop(releaseAwaited)
+	sendAPI.awaited = awaited
+	txAPI.awaited = awaited
 	debugAPI := NewDebugAPI(tmClient, k, beginBlockKeepers, ctxProvider, txConfigProvider, simulateConfig, app, antehandler, ConnectionTypeHTTP, config, globalBlockCache, cacheCreationMutex, watermarks)
 	debugAPI.backend.SetTraceContextProvider(traceCtxProvider)
 	if config.TraceBakeEnabled {
@@ -235,6 +245,7 @@ func NewEVMHTTPServer(
 		return nil, err
 	}
 
+	built = true
 	return httpServer, nil
 }
 
@@ -288,6 +299,18 @@ func NewEVMWebSocketServer(
 	globalBlockCache := NewBlockCache(3000)
 	cacheCreationMutex := &sync.Mutex{}
 	globalLogSlicePool := NewLogSlicePool()
+	wsTxAPI := NewTransactionAPI(tmClient, k, ctxProvider, txConfigProvider, homeDir, ConnectionTypeWS, methodTimeout, watermarks, globalBlockCache, cacheCreationMutex)
+	wsSendAPI := NewSendAPI(tmClient, txConfigProvider, NewSendConfig(config.Slow, config.EnableSimulation, autobahnEnabled), k, beginBlockKeepers, ctxProvider, homeDir, simulateConfig, app, antehandler, ConnectionTypeWS, methodTimeout, globalBlockCache, cacheCreationMutex, watermarks)
+	wsAwaited, releaseAwaited := acquireAwaitedTxs(tmClient, txConfigProvider, watermarks)
+	built := false
+	defer func() {
+		if !built {
+			releaseAwaited()
+		}
+	}()
+	httpServer.releaseOnStop(releaseAwaited)
+	wsTxAPI.awaited = wsAwaited
+	wsSendAPI.awaited = wsAwaited
 	apis := []rpc.API{
 		{
 			Namespace: "echo",
@@ -299,7 +322,7 @@ func NewEVMWebSocketServer(
 		},
 		{
 			Namespace: EthNamespace,
-			Service:   NewTransactionAPI(tmClient, k, ctxProvider, txConfigProvider, homeDir, ConnectionTypeWS, methodTimeout, watermarks, globalBlockCache, cacheCreationMutex),
+			Service:   wsTxAPI,
 		},
 		{
 			Namespace: EthNamespace,
@@ -311,7 +334,7 @@ func NewEVMWebSocketServer(
 		},
 		{
 			Namespace: EthNamespace,
-			Service:   NewSendAPI(tmClient, txConfigProvider, NewSendConfig(config.Slow, config.EnableSimulation, autobahnEnabled), k, beginBlockKeepers, ctxProvider, homeDir, simulateConfig, app, antehandler, ConnectionTypeWS, methodTimeout, globalBlockCache, cacheCreationMutex, watermarks),
+			Service:   wsSendAPI,
 		},
 		{
 			Namespace: EthNamespace,
@@ -351,5 +374,6 @@ func NewEVMWebSocketServer(
 		return nil, err
 	}
 
+	built = true
 	return httpServer, nil
 }

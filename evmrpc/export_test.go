@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math/big"
 	"sync"
+	"time"
 
 	gethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -166,4 +167,25 @@ func (i *InfoAPI) GasPriceHelperForTest(ctx context.Context, baseFee *big.Int, t
 // CalculateGasUsedRatioForTest exposes calculateGasUsedRatio for integration tests in evmrpc_test.
 func (i *InfoAPI) CalculateGasUsedRatioForTest(ctx context.Context, blockHeight int64) (float64, error) {
 	return i.calculateGasUsedRatio(ctx, blockHeight)
+}
+
+// AwaitAcceptedForTest makes t's receipt lookups of hash wait up to bound, as if this node had
+// accepted hash.
+func (t *TransactionAPI) AwaitAcceptedForTest(hash gethcommon.Hash, bound time.Duration) {
+	t.AwaitPendingForTest(bound)
+	t.awaited.remember(hash)
+}
+
+// AwaitPendingForTest makes t's receipt lookups of the transactions its node knows are pending
+// wait up to bound, as a server's lookups do.
+func (t *TransactionAPI) AwaitPendingForTest(bound time.Duration) {
+	if t.awaited == nil {
+		t.awaited = newAwaitedTxs(t.tmClient, t.txConfigProvider, t.watermarks)
+	}
+	t.awaited.bound = bound
+}
+
+// RememberAcceptedForTest records hash as accepted by this node without changing the wait bound.
+func (t *TransactionAPI) RememberAcceptedForTest(hash gethcommon.Hash) {
+	t.awaited.remember(hash)
 }

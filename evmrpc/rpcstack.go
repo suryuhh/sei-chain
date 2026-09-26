@@ -108,6 +108,9 @@ type HTTPServer struct {
 	maxOpenConns int
 
 	handlerNames map[string]string
+
+	// onStop are released when the server is stopped.
+	onStop []func()
 }
 
 const (
@@ -283,7 +286,18 @@ func (h *HTTPServer) Stop() {
 	defer h.mu.Unlock()
 	logger.Info("Stopping EVM HTTP Server")
 	h.doStop()
+	for _, release := range h.onStop {
+		release()
+	}
+	h.onStop = nil
 	logger.Info("EVM HTTP Server stopped")
+}
+
+// releaseOnStop makes Stop call release, to free what only this server's requests use.
+func (h *HTTPServer) releaseOnStop(release func()) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.onStop = append(h.onStop, release)
 }
 
 func (h *HTTPServer) doStop() {
